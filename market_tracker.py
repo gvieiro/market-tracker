@@ -9,7 +9,8 @@ import requests
 API_KEY       = os.environ["FINNHUB_API_KEY"]
 DATABASE_URL  = os.environ.get("DATABASE_URL")  # set by Railway; absent = use SQLite
 DB_FILE       = "market_data.db"
-POLL_INTERVAL = 5  # seconds
+POLL_INTERVAL  = 15   # seconds — Finnhub free tier: 60 calls/min; 4 symbols × 4 polls/min = 16 calls/min
+MAX_BACKOFF    = 120  # seconds — cap on exponential backoff after rate limit errors
 
 # Finnhub free tier does not support CFD index quotes (^GSPC, ^IXIC).
 # ETF proxies are used instead. Gold spot requires a paid forex plan; GLD ETF is used.
@@ -85,11 +86,17 @@ def fetch_quote(symbol):
         params={"symbol": symbol, "token": API_KEY},
         timeout=10,
     )
+    if response.status_code == 429:
+        raise RateLimitError("429 Too Many Requests")
     response.raise_for_status()
     data = response.json()
     if "error" in data:
         raise RuntimeError(data["error"])
     return symbol, data
+
+
+class RateLimitError(Exception):
+    pass
 
 # ── display ───────────────────────────────────────────────────────────────────
 
@@ -108,8 +115,10 @@ def print_quotes(queried_at, results):
 # ── poll loop ─────────────────────────────────────────────────────────────────
 
 def poll_once(conn, ph):
+    """Fetch all quotes and store results. Returns True if rate limited."""
     queried_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     results, errors = {}, {}
+    rate_limited = False
 
     with ThreadPoolExecutor(max_workers=len(SYMBOLS)) as pool:
         futures = {pool.submit(fetch_quote, sym): sym for sym in SYMBOLS}
@@ -118,6 +127,8 @@ def poll_once(conn, ph):
             try:
                 symbol, data = future.result()
                 results[symbol] = data
+            except RateLimitError:
+                rate_limited = True
             except Exception as e:
                 errors[sym] = str(e)
 
@@ -126,6 +137,8 @@ def poll_once(conn, ph):
     print_quotes(queried_at, results)
     for sym, err in errors.items():
         print(f"  Error fetching {sym}: {err}")
+
+    return rate_limited
 
 # ── entry point ───────────────────────────────────────────────────────────────
 
@@ -137,12 +150,20 @@ if __name__ == "__main__":
     print(f"Backend : {backend}")
     print("Press Ctrl-C to stop.")
 
+    backoff = POLL_INTERVAL
     try:
         while True:
             start = time.monotonic()
-            poll_once(conn, ph)
+            rate_limited = poll_once(conn, ph)
             elapsed = time.monotonic() - start
-            time.sleep(max(0, POLL_INTERVAL - elapsed))
+
+            if rate_limited:
+                backoff = min(backoff * 2, MAX_BACKOFF)
+                print(f"  Rate limited — backing off for {backoff}s")
+                time.sleep(backoff)
+            else:
+                backoff = POLL_INTERVAL  # reset on success
+                time.sleep(max(0, POLL_INTERVAL - elapsed))
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:

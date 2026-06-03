@@ -1,13 +1,12 @@
 import os
-import sqlite3
 import time
 from datetime import datetime, timezone
 
+import psycopg2
 import requests
 
 API_KEY        = os.environ["FINNHUB_API_KEY"]
-DATABASE_URL   = os.environ.get("DATABASE_URL")  # set by Railway; absent = use SQLite
-DB_FILE        = "market_data.db"
+DATABASE_URL   = os.environ["DATABASE_URL"]
 POLL_INTERVAL  = 15    # seconds between polls
 CALL_SPACING   = 1     # seconds between individual API calls within a poll (avoids burst limits)
 MAX_BACKOFF    = 120   # seconds — cap on exponential backoff after rate limit errors
@@ -22,18 +21,12 @@ SYMBOLS = {
     "BINANCE:BTCUSDT": "Bitcoin (USD)",
 }
 
-# ── database helpers ──────────────────────────────────────────────────────────
+# ── database ──────────────────────────────────────────────────────────────────
 
 def connect():
-    """Return (conn, placeholder) for whichever DB backend is available."""
-    if DATABASE_URL:
-        import psycopg2
-        conn = psycopg2.connect(DATABASE_URL)
-        return conn, "%s"          # psycopg2 uses %s placeholders
-    conn = sqlite3.connect(DB_FILE)
-    return conn, "?"               # sqlite3 uses ? placeholders
+    return psycopg2.connect(DATABASE_URL)
 
-def init_db(conn, ph):
+def init_db(conn):
     conn.cursor().execute("""
         CREATE TABLE IF NOT EXISTS quotes (
             id          SERIAL PRIMARY KEY,
@@ -54,7 +47,7 @@ def init_db(conn, ph):
     )
     conn.commit()
 
-def store_quotes(conn, ph, queried_at, results):
+def store_quotes(conn, queried_at, results):
     rows = [
         (
             queried_at,
@@ -70,13 +63,12 @@ def store_quotes(conn, ph, queried_at, results):
         )
         for symbol, data in results.items()
     ]
-    sql = (
-        f"INSERT INTO quotes "
-        f"(queried_at, symbol, price, change, change_pct, high, low, open, prev_close, trade_ts) "
-        f"VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph})"
+    conn.cursor().executemany(
+        "INSERT INTO quotes "
+        "(queried_at, symbol, price, change, change_pct, high, low, open, prev_close, trade_ts) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        rows,
     )
-    cur = conn.cursor()
-    cur.executemany(sql, rows)
     conn.commit()
 
 # ── Finnhub ───────────────────────────────────────────────────────────────────
@@ -114,7 +106,7 @@ def print_quotes(queried_at, results):
 
 # ── poll loop ─────────────────────────────────────────────────────────────────
 
-def poll_once(conn, ph):
+def poll_once(conn):
     """Fetch all quotes sequentially and store results. Returns True if rate limited."""
     queried_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     results, errors = {}, {}
@@ -122,7 +114,7 @@ def poll_once(conn, ph):
 
     for i, symbol in enumerate(SYMBOLS):
         if i > 0:
-            time.sleep(CALL_SPACING)  # space out calls to avoid burst limits
+            time.sleep(CALL_SPACING)
         try:
             sym, data = fetch_quote(symbol)
             results[sym] = data
@@ -132,7 +124,7 @@ def poll_once(conn, ph):
             errors[symbol] = str(e)
 
     if results:
-        store_quotes(conn, ph, queried_at, results)
+        store_quotes(conn, queried_at, results)
     print_quotes(queried_at, results)
     for sym, err in errors.items():
         print(f"  Error fetching {sym}: {err}")
@@ -142,20 +134,19 @@ def poll_once(conn, ph):
 # ── entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    conn, ph = connect()
-    init_db(conn, ph)
+    conn = connect()
+    init_db(conn)
 
-    backend = f"PostgreSQL ({DATABASE_URL.split('@')[-1]})" if DATABASE_URL else f"SQLite ({DB_FILE})"
-    print(f"Backend      : {backend}")
+    print(f"Backend      : PostgreSQL ({DATABASE_URL.split('@')[-1]})")
     print(f"Poll interval: {POLL_INTERVAL}s with {CALL_SPACING}s between calls")
     print("Press Ctrl-C to stop.")
 
-    backoff       = POLL_INTERVAL
-    clean_streak  = 0
+    backoff      = POLL_INTERVAL
+    clean_streak = 0
     try:
         while True:
             start = time.monotonic()
-            rate_limited = poll_once(conn, ph)
+            rate_limited = poll_once(conn)
             elapsed = time.monotonic() - start
 
             if rate_limited:
@@ -166,7 +157,7 @@ if __name__ == "__main__":
             else:
                 clean_streak += 1
                 if clean_streak >= BACKOFF_RESET:
-                    backoff = POLL_INTERVAL  # reset only after sustained clean run
+                    backoff = POLL_INTERVAL
                 time.sleep(max(0, POLL_INTERVAL - elapsed))
     except KeyboardInterrupt:
         print("\nStopped.")

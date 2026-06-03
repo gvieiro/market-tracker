@@ -1,6 +1,6 @@
 # Market Tracker
 
-Continuously polls [Finnhub](https://finnhub.io) for real-time market quotes every 5 seconds using parallel API calls, and stores the results in a database. Designed to run unattended on a cloud hosting platform such as [Railway](https://railway.app).
+Continuously polls [Finnhub](https://finnhub.io) for real-time market quotes every 15 seconds and stores the results in a PostgreSQL database. Designed to run unattended on [Railway](https://railway.app).
 
 ## Tracked symbols
 
@@ -17,37 +17,7 @@ Continuously polls [Finnhub](https://finnhub.io) for real-time market quotes eve
 
 - Python 3.8+
 - A free [Finnhub](https://finnhub.io) account and API key
-
-## Local setup
-
-1. Clone the repo:
-   ```bash
-   git clone https://github.com/your-username/market-tracker.git
-   cd market-tracker
-   ```
-
-2. Create a virtual environment and install dependencies:
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
-
-3. Set your Finnhub API key as an environment variable:
-   ```bash
-   export FINNHUB_API_KEY=your_api_key_here
-   ```
-
-4. Run the tracker:
-   ```bash
-   python3 market_tracker.py
-   ```
-
-Press **Ctrl-C** to stop.
-
-### Local database
-
-When running locally without a `DATABASE_URL` environment variable, quotes are stored in a SQLite file (`market_data.db`) in the project directory.
+- A PostgreSQL database (provided automatically by Railway)
 
 ## Deploying to Railway
 
@@ -55,9 +25,10 @@ When running locally without a `DATABASE_URL` environment variable, quotes are s
 2. Create a new project on [Railway](https://railway.app) and connect your GitHub repo.
 3. Add a **PostgreSQL** service to the project. Railway will automatically inject a `DATABASE_URL` environment variable into your app — no manual configuration needed.
 4. Add `FINNHUB_API_KEY` as an environment variable in the Railway dashboard under **Variables**.
-5. Railway will install dependencies from `requirements.txt` and start the script automatically.
+5. Set the start command to `python market_tracker.py`.
+6. Railway will install dependencies from `requirements.txt` and start the script automatically.
 
-The app detects `DATABASE_URL` at startup and switches to PostgreSQL automatically. Data persists across redeploys and restarts.
+Data persists across redeploys and restarts.
 
 ## Database schema
 

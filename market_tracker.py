@@ -1,16 +1,17 @@
 import os
 import sqlite3
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import requests
 
-API_KEY       = os.environ["FINNHUB_API_KEY"]
-DATABASE_URL  = os.environ.get("DATABASE_URL")  # set by Railway; absent = use SQLite
-DB_FILE       = "market_data.db"
-POLL_INTERVAL  = 15   # seconds — Finnhub free tier: 60 calls/min; 4 symbols × 4 polls/min = 16 calls/min
-MAX_BACKOFF    = 120  # seconds — cap on exponential backoff after rate limit errors
+API_KEY        = os.environ["FINNHUB_API_KEY"]
+DATABASE_URL   = os.environ.get("DATABASE_URL")  # set by Railway; absent = use SQLite
+DB_FILE        = "market_data.db"
+POLL_INTERVAL  = 15    # seconds between polls
+CALL_SPACING   = 1     # seconds between individual API calls within a poll (avoids burst limits)
+MAX_BACKOFF    = 120   # seconds — cap on exponential backoff after rate limit errors
+BACKOFF_RESET  = 3     # number of consecutive clean polls before backoff resets to POLL_INTERVAL
 
 # Finnhub free tier does not support CFD index quotes (^GSPC, ^IXIC).
 # ETF proxies are used instead. Gold spot requires a paid forex plan; GLD ETF is used.
@@ -33,7 +34,7 @@ def connect():
     return conn, "?"               # sqlite3 uses ? placeholders
 
 def init_db(conn, ph):
-    conn.cursor().execute(f"""
+    conn.cursor().execute("""
         CREATE TABLE IF NOT EXISTS quotes (
             id          SERIAL PRIMARY KEY,
             queried_at  TEXT    NOT NULL,
@@ -80,6 +81,9 @@ def store_quotes(conn, ph, queried_at, results):
 
 # ── Finnhub ───────────────────────────────────────────────────────────────────
 
+class RateLimitError(Exception):
+    pass
+
 def fetch_quote(symbol):
     response = requests.get(
         "https://finnhub.io/api/v1/quote",
@@ -93,10 +97,6 @@ def fetch_quote(symbol):
     if "error" in data:
         raise RuntimeError(data["error"])
     return symbol, data
-
-
-class RateLimitError(Exception):
-    pass
 
 # ── display ───────────────────────────────────────────────────────────────────
 
@@ -115,22 +115,21 @@ def print_quotes(queried_at, results):
 # ── poll loop ─────────────────────────────────────────────────────────────────
 
 def poll_once(conn, ph):
-    """Fetch all quotes and store results. Returns True if rate limited."""
+    """Fetch all quotes sequentially and store results. Returns True if rate limited."""
     queried_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     results, errors = {}, {}
     rate_limited = False
 
-    with ThreadPoolExecutor(max_workers=len(SYMBOLS)) as pool:
-        futures = {pool.submit(fetch_quote, sym): sym for sym in SYMBOLS}
-        for future in as_completed(futures):
-            sym = futures[future]
-            try:
-                symbol, data = future.result()
-                results[symbol] = data
-            except RateLimitError:
-                rate_limited = True
-            except Exception as e:
-                errors[sym] = str(e)
+    for i, symbol in enumerate(SYMBOLS):
+        if i > 0:
+            time.sleep(CALL_SPACING)  # space out calls to avoid burst limits
+        try:
+            sym, data = fetch_quote(symbol)
+            results[sym] = data
+        except RateLimitError:
+            rate_limited = True
+        except Exception as e:
+            errors[symbol] = str(e)
 
     if results:
         store_quotes(conn, ph, queried_at, results)
@@ -147,10 +146,12 @@ if __name__ == "__main__":
     init_db(conn, ph)
 
     backend = f"PostgreSQL ({DATABASE_URL.split('@')[-1]})" if DATABASE_URL else f"SQLite ({DB_FILE})"
-    print(f"Backend : {backend}")
+    print(f"Backend      : {backend}")
+    print(f"Poll interval: {POLL_INTERVAL}s with {CALL_SPACING}s between calls")
     print("Press Ctrl-C to stop.")
 
-    backoff = POLL_INTERVAL
+    backoff       = POLL_INTERVAL
+    clean_streak  = 0
     try:
         while True:
             start = time.monotonic()
@@ -158,11 +159,14 @@ if __name__ == "__main__":
             elapsed = time.monotonic() - start
 
             if rate_limited:
+                clean_streak = 0
                 backoff = min(backoff * 2, MAX_BACKOFF)
                 print(f"  Rate limited — backing off for {backoff}s")
                 time.sleep(backoff)
             else:
-                backoff = POLL_INTERVAL  # reset on success
+                clean_streak += 1
+                if clean_streak >= BACKOFF_RESET:
+                    backoff = POLL_INTERVAL  # reset only after sustained clean run
                 time.sleep(max(0, POLL_INTERVAL - elapsed))
     except KeyboardInterrupt:
         print("\nStopped.")

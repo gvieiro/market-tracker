@@ -39,8 +39,13 @@ def init_db(conn):
             low         REAL,
             open        REAL,
             prev_close  REAL,
-            trade_ts    INTEGER
+            trade_ts    INTEGER,
+            error       TEXT
         )
+    """)
+    # Add error column if it doesn't exist (for existing deployments)
+    conn.cursor().execute("""
+        ALTER TABLE quotes ADD COLUMN IF NOT EXISTS error TEXT
     """)
     conn.cursor().execute(
         "CREATE INDEX IF NOT EXISTS idx_symbol_time ON quotes (symbol, queried_at)"
@@ -48,25 +53,27 @@ def init_db(conn):
     conn.commit()
 
 def store_quotes(conn, queried_at, results):
+    """Store one row per symbol — NULL prices for failures, error text for diagnostics."""
     rows = [
         (
             queried_at,
             symbol,
-            data.get("c"),
-            data.get("d"),
-            data.get("dp"),
-            data.get("h"),
-            data.get("l"),
-            data.get("o"),
-            data.get("pc"),
-            data.get("t"),
+            data.get("c") if data else None,
+            data.get("d") if data else None,
+            data.get("dp") if data else None,
+            data.get("h") if data else None,
+            data.get("l") if data else None,
+            data.get("o") if data else None,
+            data.get("pc") if data else None,
+            data.get("t") if data else None,
+            data.get("error") if data else "unknown error",
         )
         for symbol, data in results.items()
     ]
     conn.cursor().executemany(
         "INSERT INTO quotes "
-        "(queried_at, symbol, price, change, change_pct, high, low, open, prev_close, trade_ts) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        "(queried_at, symbol, price, change, change_pct, high, low, open, prev_close, trade_ts, error) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
         rows,
     )
     conn.commit()
@@ -96,8 +103,9 @@ def print_quotes(queried_at, results):
     print(f"\n── {queried_at} ──────────────────────────────")
     for symbol, label in SYMBOLS.items():
         data = results.get(symbol)
-        if data is None:
-            print(f"  {label}: error")
+        if data is None or data.get("error"):
+            err = data.get("error") if data else "no data"
+            print(f"  {label}: error — {err}")
             continue
         price  = data.get("c") or 0
         change = data.get("d") or 0
@@ -107,9 +115,9 @@ def print_quotes(queried_at, results):
 # ── poll loop ─────────────────────────────────────────────────────────────────
 
 def poll_once(conn):
-    """Fetch all quotes sequentially and store results. Returns True if rate limited."""
+    """Fetch all quotes sequentially and store one row per symbol. Returns True if rate limited."""
     queried_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    results, errors = {}, {}
+    results = {}
     rate_limited = False
 
     for i, symbol in enumerate(SYMBOLS):
@@ -117,17 +125,15 @@ def poll_once(conn):
             time.sleep(CALL_SPACING)
         try:
             sym, data = fetch_quote(symbol)
-            results[sym] = data
+            results[sym] = data  # successful fetch — no error key
         except RateLimitError:
             rate_limited = True
+            results[symbol] = {"error": "rate limited"}
         except Exception as e:
-            errors[symbol] = str(e)
+            results[symbol] = {"error": str(e)}
 
-    if results:
-        store_quotes(conn, queried_at, results)
+    store_quotes(conn, queried_at, results)
     print_quotes(queried_at, results)
-    for sym, err in errors.items():
-        print(f"  Error fetching {sym}: {err}")
 
     return rate_limited
 
